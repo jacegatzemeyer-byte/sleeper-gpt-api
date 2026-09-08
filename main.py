@@ -8,19 +8,20 @@ import requests
 
 app = FastAPI(
     title="Sleeper Free Agent API",
-    version="1.2.0",
+    version="1.2.1",
     description="Filtered free-agent lookup for Sleeper fantasy leagues.",
 )
 
-# In-memory cache for master NFL player data
 PLAYERS_CACHE = {}
 CACHE_TIMESTAMP = 0
-CACHE_DURATION = 86400  # 24 hours in seconds
+CACHE_DURATION = 86400  # 24 hours
 
-# In-memory cache for trending adds (shorter TTL)
 TRENDING_CACHE = {}
 TRENDING_TIMESTAMP = 0
 TRENDING_CACHE_DURATION = 900  # 15 minutes
+
+# Strictly allowed offensive fantasy positions (excludes OL, DL, LB, DB, etc.)
+VALID_FANTASY_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
 
 def get_cached_players():
@@ -39,7 +40,7 @@ def get_cached_trending():
     now = time.time()
     if not TRENDING_CACHE or (now - TRENDING_TIMESTAMP) > TRENDING_CACHE_DURATION:
         res = requests.get(
-            "https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=150"
+            "https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=200"
         )
         if res.status_code == 200:
             TRENDING_CACHE = {
@@ -62,7 +63,7 @@ def get_free_agents(
     ),
     active_teams_only: bool = Query(
         True,
-        description="Filter out unsigned free agents (FA) and require an active NFL team",
+        description="Require player to be signed to an active NFL franchise (filters out FAs and retired players)",
     ),
     trending_only: bool = Query(
         False, description="Only return players actively trending as adds"
@@ -76,7 +77,6 @@ def get_free_agents(
     ),
     format: str = Query("csv", description="Response format: 'csv' or 'json'"),
 ):
-    # 1. Fetch league rosters to identify claimed player IDs
     roster_res = requests.get(
         f"https://api.sleeper.app/v1/league/{league_id}/rosters"
     )
@@ -92,37 +92,37 @@ def get_free_agents(
         if team.get("players"):
             rostered_ids.update(team["players"])
 
-    # 2. Retrieve cached player and trending datasets
     all_players = get_cached_players()
     trending_map = get_cached_trending()
 
-    # Parse requested positions
-    filter_positions = set()
+    # Determine allowed positions
     if positions:
-        filter_positions = {
+        target_positions = {
             pos.strip().upper() for pos in positions.split(",") if pos.strip()
         }
+    else:
+        target_positions = VALID_FANTASY_POSITIONS
 
-    # 3. Filter candidates
     candidates = []
     for pid, info in all_players.items():
         if pid in rostered_ids:
             continue
 
-        pos_list = info.get("fantasy_positions") or []
+        raw_positions = set(info.get("fantasy_positions") or [])
         status = info.get("status")
         team = info.get("team")
 
-        # Drop inactive, retired, or unlisted players without valid fantasy positions
-        if not pos_list or status in ["Inactive", "Retired", None]:
+        # 1. Hard filter: Must match an offensive fantasy skill position
+        matched_positions = raw_positions.intersection(target_positions)
+        if not matched_positions:
             continue
 
-        # Drop unsigned free agents if active_teams_only is enabled
-        if active_teams_only and (not team or team == "FA"):
+        # 2. Hard filter: Exclude non-active / retired statuses
+        if status in ["Inactive", "Retired", None]:
             continue
 
-        # Position filter
-        if filter_positions and not any(p in filter_positions for p in pos_list):
+        # 3. Hard filter: Exclude unsigned players (removes Bell, Gallup, free agents)
+        if active_teams_only and (not team or team in ["FA", "FREE_AGENT"]):
             continue
 
         trend_count = trending_map.get(pid, 0)
@@ -134,7 +134,7 @@ def get_free_agents(
                 "id": str(pid),
                 "name": info.get("full_name")
                 or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip(),
-                "pos": "/".join(pos_list),
+                "pos": "/".join(matched_positions),
                 "team": team or "FA",
                 "status": status,
                 "depth_chart": info.get("depth_chart_order") or 99,
@@ -143,7 +143,7 @@ def get_free_agents(
             }
         )
 
-    # 4. Sorting logic
+    # Sorting logic
     if sort_by == "trending_count":
         candidates.sort(key=lambda x: x["trending_count"], reverse=True)
     elif sort_by == "depth_chart":
@@ -155,7 +155,6 @@ def get_free_agents(
 
     results = candidates[:limit]
 
-    # 5. Output rendering
     if format.lower() == "json":
         return JSONResponse(content=results)
 
