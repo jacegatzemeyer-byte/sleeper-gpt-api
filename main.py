@@ -8,7 +8,7 @@ import requests
 
 app = FastAPI(
     title="Sleeper Free Agent API",
-    version="1.1.0",
+    version="1.2.0",
     description="Filtered free-agent lookup for Sleeper fantasy leagues.",
 )
 
@@ -42,7 +42,6 @@ def get_cached_trending():
             "https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=150"
         )
         if res.status_code == 200:
-            # Map player_id -> trending count
             TRENDING_CACHE = {
                 item["player_id"]: item.get("count", 0) for item in res.json()
             }
@@ -60,6 +59,10 @@ def get_free_agents(
     league_id: str = Query(..., description="Sleeper League ID"),
     positions: Optional[str] = Query(
         None, description="Comma-separated list (e.g. RB,WR,TE)"
+    ),
+    active_teams_only: bool = Query(
+        True,
+        description="Filter out unsigned free agents (FA) and require an active NFL team",
     ),
     trending_only: bool = Query(
         False, description="Only return players actively trending as adds"
@@ -108,9 +111,14 @@ def get_free_agents(
 
         pos_list = info.get("fantasy_positions") or []
         status = info.get("status")
+        team = info.get("team")
 
-        # Drop inactive/retired players and items without valid fantasy positions
-        if not pos_list or status in ["Inactive", None]:
+        # Drop inactive, retired, or unlisted players without valid fantasy positions
+        if not pos_list or status in ["Inactive", "Retired", None]:
+            continue
+
+        # Drop unsigned free agents if active_teams_only is enabled
+        if active_teams_only and (not team or team == "FA"):
             continue
 
         # Position filter
@@ -124,9 +132,10 @@ def get_free_agents(
         candidates.append(
             {
                 "id": str(pid),
-                "name": info.get("full_name") or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip(),
+                "name": info.get("full_name")
+                or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip(),
                 "pos": "/".join(pos_list),
-                "team": info.get("team") or "FA",
+                "team": team or "FA",
                 "status": status,
                 "depth_chart": info.get("depth_chart_order") or 99,
                 "exp": info.get("years_exp") or 0,
@@ -150,7 +159,6 @@ def get_free_agents(
     if format.lower() == "json":
         return JSONResponse(content=results)
 
-    # Default: Plaintext CSV for optimal GPT token economy
     output = io.StringIO()
     fieldnames = [
         "id",
