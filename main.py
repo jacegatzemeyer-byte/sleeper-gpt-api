@@ -1,16 +1,19 @@
 import io
 import csv
 import time
+import asyncio
+from contextlib import asynccontextmanager
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 import httpx
 
-app = FastAPI(
-    title="Sleeper Dynasty Advisor API",
-    version="1.5.0",
-    description="Middleware for Sleeper Dynasty Fantasy Football League analytics, roster analysis, and matchups."
-)
+# In-memory storage
+PLAYER_CACHE: Dict[str, Any] = {"data": {}, "timestamp": 0}
+TRENDING_CACHE: Dict[str, Any] = {"data": [], "timestamp": 0}
+
+PLAYER_TTL = 86400   # 24 hours
+TRENDING_TTL = 900   # 15 minutes
 
 ACTIVE_NFL_TEAMS = {
     "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN",
@@ -23,32 +26,61 @@ DISALLOWED_POSITIONS = {
     "OL", "OT", "OG", "C", "DL", "DE", "DT", "LB", "DB", "CB", "S", "DEF"
 }
 
-PLAYER_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0}
-TRENDING_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0}
-PLAYER_TTL = 86400  # 24 hours
-TRENDING_TTL = 900  # 15 minutes
+HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.5.1"}
+
+
+async def refresh_players():
+    """Fetches Sleeper's master player database safely in the background."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0, headers=HEADERS) as client:
+            resp = await client.get("https://api.sleeper.app/v1/players/nfl")
+            if resp.status_code == 200:
+                PLAYER_CACHE["data"] = resp.json()
+                PLAYER_CACHE["timestamp"] = time.time()
+                print(f"[Cache] Successfully loaded {len(PLAYER_CACHE['data'])} NFL players.")
+    except Exception as e:
+        print(f"[Cache Error] Failed to refresh players: {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Pre-warm the cache at startup so incoming GPT requests respond instantly
+    asyncio.create_task(refresh_players())
+    yield
+
+
+app = FastAPI(
+    title="Sleeper Dynasty Advisor API",
+    version="1.5.1",
+    lifespan=lifespan
+)
 
 
 async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
     now = time.time()
+    # If empty or expired, refresh, but fall back to existing data on failure
     if not PLAYER_CACHE["data"] or (now - PLAYER_CACHE["timestamp"] > PLAYER_TTL):
-        resp = await client.get("https://api.sleeper.app/v1/players/nfl")
-        if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch Sleeper players.")
-        PLAYER_CACHE["data"] = resp.json()
-        PLAYER_CACHE["timestamp"] = now
+        try:
+            resp = await client.get("https://api.sleeper.app/v1/players/nfl")
+            if resp.status_code == 200:
+                PLAYER_CACHE["data"] = resp.json()
+                PLAYER_CACHE["timestamp"] = now
+        except Exception:
+            if not PLAYER_CACHE["data"]:
+                raise HTTPException(status_code=503, detail="Sleeper player catalog currently initializing. Retry in 10s.")
     return PLAYER_CACHE["data"]
 
 
 async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     now = time.time()
     if not TRENDING_CACHE["data"] or (now - TRENDING_CACHE["timestamp"] > TRENDING_TTL):
-        resp = await client.get("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=50")
-        if resp.status_code != 200:
-            TRENDING_CACHE["data"] = []
-        else:
-            TRENDING_CACHE["data"] = resp.json()
-        TRENDING_CACHE["timestamp"] = now
+        try:
+            resp = await client.get("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=50")
+            if resp.status_code == 200:
+                TRENDING_CACHE["data"] = resp.json()
+                TRENDING_CACHE["timestamp"] = now
+        except Exception:
+            pass  # Fail gracefully to existing cache or empty list
     return TRENDING_CACHE["data"]
 
 
@@ -56,36 +88,33 @@ async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]
 async def root():
     return {
         "status": "healthy",
-        "version": "1.5.0",
-        "message": "Sleeper Dynasty Advisor API is running."
+        "version": "1.5.1",
+        "players_cached": len(PLAYER_CACHE["data"]),
+        "message": "Sleeper Dynasty Advisor API is active."
     }
 
 
 @app.get("/free-agents")
 async def get_free_agents(
     league_id: str = "1399229018905034752",
-    positions: Optional[str] = Query(None, description="Comma-separated positions: QB,RB,WR,TE,K"),
+    positions: Optional[str] = Query(None, description="Comma-separated: QB,RB,WR,TE,K"),
     active_teams_only: bool = True,
     trending_only: bool = False,
     sort_by: str = "trending_count",
     limit: int = 50,
     format: str = "csv"
 ):
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
         players = await get_cached_players(client)
         trending_list = await get_cached_trending(client)
         trending_map = {item["player_id"]: item["count"] for item in trending_list}
 
         rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
         if rosters_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch league rosters.")
+            raise HTTPException(status_code=rosters_resp.status_code, detail="Unable to retrieve league rosters.")
         rosters = rosters_resp.json()
 
-    rostered_ids = set()
-    for r in rosters:
-        for pid in r.get("players") or []:
-            rostered_ids.add(pid)
-
+    rostered_ids = {pid for r in rosters for pid in (r.get("players") or [])}
     pos_filter = set(positions.upper().split(",")) if positions else None
     results = []
 
@@ -127,10 +156,7 @@ async def get_free_agents(
         return results
 
     output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"]
-    )
+    writer = csv.DictWriter(output, fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"])
     writer.writeheader()
     writer.writerows(results)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
@@ -142,24 +168,24 @@ async def get_roster(
     username: str = "jgatz12",
     format: str = "csv"
 ):
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
         players = await get_cached_players(client)
         users_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
         rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
 
         if users_resp.status_code != 200 or rosters_resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="Failed to fetch league data.")
+            raise HTTPException(status_code=502, detail="Failed to fetch league data from Sleeper.")
 
         users = users_resp.json()
         rosters = rosters_resp.json()
 
     user = next((u for u in users if u.get("display_name", "").lower() == username.lower()), None)
     if not user:
-        raise HTTPException(status_code=404, detail=f"User {username} not found in league.")
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found in league.")
 
     roster = next((r for r in rosters if r.get("owner_id") == user["user_id"]), None)
     if not roster:
-        raise HTTPException(status_code=404, detail=f"Roster not found for user {username}.")
+        raise HTTPException(status_code=404, detail=f"Roster not found for user '{username}'.")
 
     starter_ids = set(roster.get("starters") or [])
     taxi_ids = set(roster.get("taxi") or [])
@@ -169,14 +195,7 @@ async def get_roster(
     rows = []
     for pid in all_player_ids:
         p_info = players.get(pid, {})
-        if pid in starter_ids:
-            slot = "STARTER"
-        elif pid in taxi_ids:
-            slot = "TAXI"
-        elif pid in reserve_ids:
-            slot = "IR"
-        else:
-            slot = "BENCH"
+        slot = "STARTER" if pid in starter_ids else ("TAXI" if pid in taxi_ids else ("IR" if pid in reserve_ids else "BENCH"))
 
         rows.append({
             "id": pid,
@@ -209,61 +228,53 @@ async def get_matchup(
     starters_only: bool = False,
     format: str = "csv"
 ):
-    async with httpx.AsyncClient(timeout=15.0) as client:
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
         players = await get_cached_players(client)
 
-        # 1. Resolve active week if omitted
         if week is None:
             state_resp = await client.get("https://api.sleeper.app/v1/state/nfl")
-            if state_resp.status_code != 200:
-                raise HTTPException(status_code=502, detail="Failed to fetch NFL state.")
-            week = state_resp.json().get("week", 1)
+            week = state_resp.json().get("week", 1) if state_resp.status_code == 200 else 1
 
         users_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
         rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
         matchups_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}")
 
         if any(r.status_code != 200 for r in (users_resp, rosters_resp, matchups_resp)):
-            raise HTTPException(status_code=502, detail="Failed to fetch matchup data.")
+            raise HTTPException(status_code=502, detail=f"Failed to fetch matchup data for week {week}.")
 
         users = users_resp.json()
         rosters = rosters_resp.json()
         matchups = matchups_resp.json()
 
-    # Map user_id to display name & roster_id to user display name
     user_id_to_name = {u["user_id"]: u.get("display_name", "Unknown") for u in users}
     roster_id_to_name = {r["roster_id"]: user_id_to_name.get(r.get("owner_id"), f"Team {r['roster_id']}") for r in rosters}
 
-    # Find target user's roster_id
     target_user = next((u for u in users if u.get("display_name", "").lower() == username.lower()), None)
     if not target_user:
-        raise HTTPException(status_code=404, detail=f"User {username} not found.")
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found in league.")
 
     target_roster = next((r for r in rosters if r.get("owner_id") == target_user["user_id"]), None)
     if not target_roster:
-        raise HTTPException(status_code=404, detail=f"Roster not found for user {username}.")
+        raise HTTPException(status_code=404, detail=f"Roster not found for '{username}'.")
 
     target_roster_id = target_roster["roster_id"]
-
-    # Locate user matchup
     user_matchup = next((m for m in matchups if m.get("roster_id") == target_roster_id), None)
     if not user_matchup:
-        raise HTTPException(status_code=404, detail=f"Matchup data not found for week {week}.")
+        raise HTTPException(status_code=404, detail=f"No matchup scheduled for week {week}.")
 
     matchup_id = user_matchup.get("matchup_id")
-    opponent_matchup = next((m for m in matchups if m.get("matchup_id") == matchup_id and m.get("roster_id") != target_roster_id), None)
+    opp_matchup = next((m for m in matchups if m.get("matchup_id") == matchup_id and m.get("roster_id") != target_roster_id), None)
 
-    teams_to_process = [("USER", user_matchup, roster_id_to_name.get(target_roster_id, username))]
-    if opponent_matchup:
-        opp_name = roster_id_to_name.get(opponent_matchup["roster_id"], "Opponent")
-        teams_to_process.append(("OPPONENT", opponent_matchup, opp_name))
+    teams = [("USER", user_matchup, roster_id_to_name.get(target_roster_id, username))]
+    if opp_matchup:
+        teams.append(("OPPONENT", opp_matchup, roster_id_to_name.get(opp_matchup["roster_id"], "Opponent")))
 
     rows = []
-    for side, m_data, team_name in teams_to_process:
+    for side, m_data, team_name in teams:
         starter_ids = set(m_data.get("starters") or [])
-        player_ids = starter_ids if starters_only else (m_data.get("players") or [])
+        pids = starter_ids if starters_only else (m_data.get("players") or [])
 
-        for pid in player_ids:
+        for pid in pids:
             p_info = players.get(pid, {})
             slot = "STARTER" if pid in starter_ids else "BENCH"
             rows.append({
@@ -283,10 +294,7 @@ async def get_matchup(
         return rows
 
     output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["week", "side", "team_name", "slot", "id", "name", "pos", "nfl_team", "depth_chart", "proj_or_actual_pts"]
-    )
+    writer = csv.DictWriter(output, fieldnames=["week", "side", "team_name", "slot", "id", "name", "pos", "nfl_team", "depth_chart", "proj_or_actual_pts"])
     writer.writeheader()
     writer.writerows(rows)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
