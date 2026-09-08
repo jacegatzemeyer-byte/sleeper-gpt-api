@@ -1,346 +1,292 @@
-import csv
 import io
+import csv
 import time
-from typing import Optional
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import JSONResponse
-import requests
+from typing import Optional, List, Dict, Any
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.responses import PlainTextResponse
+import httpx
 
 app = FastAPI(
-    title="Sleeper Free Agent & Roster API",
-    version="1.4.0",
-    description="Filtered free-agent lookup and team roster inspection for Sleeper fantasy leagues.",
+    title="Sleeper Dynasty Advisor API",
+    version="1.5.0",
+    description="Middleware for Sleeper Dynasty Fantasy Football League analytics, roster analysis, and matchups."
 )
 
-PLAYERS_CACHE = {}
-CACHE_TIMESTAMP = 0
-CACHE_DURATION = 86400  # 24 hours
-
-TRENDING_CACHE = {}
-TRENDING_TIMESTAMP = 0
-TRENDING_CACHE_DURATION = 900  # 15 minutes
-
 ACTIVE_NFL_TEAMS = {
-    "ARI",
-    "ATL",
-    "BAL",
-    "BUF",
-    "CAR",
-    "CHI",
-    "CIN",
-    "CLE",
-    "DAL",
-    "DEN",
-    "DET",
-    "GB",
-    "HOU",
-    "IND",
-    "JAX",
-    "KC",
-    "LAC",
-    "LAR",
-    "LV",
-    "MIA",
-    "MIN",
-    "NE",
-    "NO",
-    "NYG",
-    "NYJ",
-    "PHI",
-    "PIT",
-    "SEA",
-    "SF",
-    "TB",
-    "TEN",
-    "WAS",
+    "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN",
+    "DET", "GB", "HOU", "IND", "JAX", "KC", "LV", "LAC", "LAR", "MIA",
+    "MIN", "NE", "NO", "NYG", "NYJ", "PHI", "PIT", "SF", "SEA", "TB",
+    "TEN", "WAS"
 }
-
-VALID_OFFENSIVE_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
 DISALLOWED_POSITIONS = {
-    "OL",
-    "OT",
-    "OG",
-    "C",
-    "DL",
-    "DE",
-    "DT",
-    "LB",
-    "ILB",
-    "OLB",
-    "DB",
-    "CB",
-    "S",
-    "FS",
-    "SS",
+    "OL", "OT", "OG", "C", "DL", "DE", "DT", "LB", "DB", "CB", "S", "DEF"
 }
 
+PLAYER_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0}
+TRENDING_CACHE: Dict[str, Any] = {"data": None, "timestamp": 0}
+PLAYER_TTL = 86400  # 24 hours
+TRENDING_TTL = 900  # 15 minutes
 
-def get_cached_players():
-    global PLAYERS_CACHE, CACHE_TIMESTAMP
+
+async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
     now = time.time()
-    if not PLAYERS_CACHE or (now - CACHE_TIMESTAMP) > CACHE_DURATION:
-        res = requests.get("https://api.sleeper.app/v1/players/nfl")
-        if res.status_code == 200:
-            PLAYERS_CACHE = res.json()
-            CACHE_TIMESTAMP = now
-    return PLAYERS_CACHE
+    if not PLAYER_CACHE["data"] or (now - PLAYER_CACHE["timestamp"] > PLAYER_TTL):
+        resp = await client.get("https://api.sleeper.app/v1/players/nfl")
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch Sleeper players.")
+        PLAYER_CACHE["data"] = resp.json()
+        PLAYER_CACHE["timestamp"] = now
+    return PLAYER_CACHE["data"]
 
 
-def get_cached_trending():
-    global TRENDING_CACHE, TRENDING_TIMESTAMP
+async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]:
     now = time.time()
-    if not TRENDING_CACHE or (now - TRENDING_TIMESTAMP) > TRENDING_CACHE_DURATION:
-        res = requests.get(
-            "https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=250"
-        )
-        if res.status_code == 200:
-            TRENDING_CACHE = {
-                str(item["player_id"]): item.get("count", 0)
-                for item in res.json()
-            }
-            TRENDING_TIMESTAMP = now
-    return TRENDING_CACHE
+    if not TRENDING_CACHE["data"] or (now - TRENDING_CACHE["timestamp"] > TRENDING_TTL):
+        resp = await client.get("https://api.sleeper.app/v1/players/nfl/trending/add?lookback_hours=24&limit=50")
+        if resp.status_code != 200:
+            TRENDING_CACHE["data"] = []
+        else:
+            TRENDING_CACHE["data"] = resp.json()
+        TRENDING_CACHE["timestamp"] = now
+    return TRENDING_CACHE["data"]
 
 
 @app.get("/")
-def health_check():
+async def root():
     return {
-        "status": "ok",
-        "version": "1.4.0",
-        "message": "Sleeper Free Agent & Roster API is live",
+        "status": "healthy",
+        "version": "1.5.0",
+        "message": "Sleeper Dynasty Advisor API is running."
     }
 
 
-@app.get("/roster")
-def get_roster(
-    league_id: str = Query(
-        "1399229018905034752", description="Sleeper League ID"
-    ),
-    username: str = Query(
-        "jgatz12",
-        description="Sleeper username or display name to fetch roster for",
-    ),
-    format: str = Query("csv", description="Output format: 'csv' or 'json'"),
+@app.get("/free-agents")
+async def get_free_agents(
+    league_id: str = "1399229018905034752",
+    positions: Optional[str] = Query(None, description="Comma-separated positions: QB,RB,WR,TE,K"),
+    active_teams_only: bool = True,
+    trending_only: bool = False,
+    sort_by: str = "trending_count",
+    limit: int = 50,
+    format: str = "csv"
 ):
-    # 1. Map users to identify owner_id
-    users_res = requests.get(
-        f"https://api.sleeper.app/v1/league/{league_id}/users"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        players = await get_cached_players(client)
+        trending_list = await get_cached_trending(client)
+        trending_map = {item["player_id"]: item["count"] for item in trending_list}
+
+        rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
+        if rosters_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch league rosters.")
+        rosters = rosters_resp.json()
+
+    rostered_ids = set()
+    for r in rosters:
+        for pid in r.get("players") or []:
+            rostered_ids.add(pid)
+
+    pos_filter = set(positions.upper().split(",")) if positions else None
+    results = []
+
+    for pid, p in players.items():
+        if pid in rostered_ids:
+            continue
+
+        team = p.get("team")
+        pos = p.get("position")
+
+        if active_teams_only and team not in ACTIVE_NFL_TEAMS:
+            continue
+        if pos in DISALLOWED_POSITIONS:
+            continue
+        if pos_filter and pos not in pos_filter:
+            continue
+
+        t_count = trending_map.get(pid, 0)
+        if trending_only and t_count == 0:
+            continue
+
+        results.append({
+            "id": pid,
+            "name": p.get("full_name") or f"{p.get('first_name', '')} {p.get('last_name', '')}".strip(),
+            "pos": pos or "NA",
+            "team": team or "FA",
+            "status": p.get("status") or "Active",
+            "depth_chart": p.get("depth_chart_order") or "",
+            "exp": p.get("years_exp", 0),
+            "trending_count": t_count
+        })
+
+    if sort_by == "trending_count":
+        results.sort(key=lambda x: x["trending_count"], reverse=True)
+
+    results = results[:limit]
+
+    if format.lower() == "json":
+        return results
+
+    output = io.StringIO()
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"]
     )
-    if users_res.status_code != 200:
-        return Response(
-            content="Invalid League ID",
-            status_code=400,
-            media_type="text/plain",
-        )
+    writer.writeheader()
+    writer.writerows(results)
+    return PlainTextResponse(output.getvalue(), media_type="text/csv")
 
-    target_user_id = None
-    clean_username = username.strip().lower()
-    for u in users_res.json():
-        uname = (u.get("username") or "").lower()
-        dname = (u.get("display_name") or "").lower()
-        tname = (u.get("metadata", {}).get("team_name") or "").lower()
-        if clean_username in [uname, dname, tname]:
-            target_user_id = u.get("user_id")
-            break
 
-    # 2. Fetch rosters
-    roster_res = requests.get(
-        f"https://api.sleeper.app/v1/league/{league_id}/rosters"
-    )
-    if roster_res.status_code != 200:
-        return Response(
-            content="Could not fetch rosters",
-            status_code=400,
-            media_type="text/plain",
-        )
+@app.get("/roster")
+async def get_roster(
+    league_id: str = "1399229018905034752",
+    username: str = "jgatz12",
+    format: str = "csv"
+):
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        players = await get_cached_players(client)
+        users_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
+        rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
 
-    target_roster = None
-    for r in roster_res.json():
-        if r.get("owner_id") == target_user_id:
-            target_roster = r
-            break
+        if users_resp.status_code != 200 or rosters_resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="Failed to fetch league data.")
 
-    if not target_roster:
-        return Response(
-            content=f"Roster not found for user: {username}",
-            status_code=404,
-            media_type="text/plain",
-        )
+        users = users_resp.json()
+        rosters = rosters_resp.json()
 
-    all_players = get_cached_players()
-    starters = set(target_roster.get("starters") or [])
-    taxi = set(target_roster.get("taxi") or [])
-    reserve = set(target_roster.get("reserve") or [])
-    all_rostered = target_roster.get("players") or []
+    user = next((u for u in users if u.get("display_name", "").lower() == username.lower()), None)
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User {username} not found in league.")
 
-    roster_list = []
-    for pid in all_rostered:
-        str_pid = str(pid)
-        info = all_players.get(str_pid, {})
+    roster = next((r for r in rosters if r.get("owner_id") == user["user_id"]), None)
+    if not roster:
+        raise HTTPException(status_code=404, detail=f"Roster not found for user {username}.")
 
-        # Slot classification
-        if str_pid in starters:
+    starter_ids = set(roster.get("starters") or [])
+    taxi_ids = set(roster.get("taxi") or [])
+    reserve_ids = set(roster.get("reserve") or [])
+    all_player_ids = roster.get("players") or []
+
+    rows = []
+    for pid in all_player_ids:
+        p_info = players.get(pid, {})
+        if pid in starter_ids:
             slot = "STARTER"
-        elif str_pid in taxi:
+        elif pid in taxi_ids:
             slot = "TAXI"
-        elif str_pid in reserve:
+        elif pid in reserve_ids:
             slot = "IR"
         else:
             slot = "BENCH"
 
-        roster_list.append(
-            {
-                "id": str_pid,
-                "name": info.get("full_name")
-                or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
-                or str_pid,
-                "pos": "/".join(info.get("fantasy_positions") or ["DEF"]),
-                "team": info.get("team") or "FA",
-                "slot": slot,
-                "depth_chart": info.get("depth_chart_order") or 99,
-                "exp": info.get("years_exp") or 0,
-            }
-        )
+        rows.append({
+            "id": pid,
+            "name": p_info.get("full_name") or f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip(),
+            "pos": p_info.get("position", "NA"),
+            "team": p_info.get("team", "FA"),
+            "slot": slot,
+            "depth_chart": p_info.get("depth_chart_order") or "",
+            "exp": p_info.get("years_exp", 0)
+        })
 
-    # Sort: Starters first, then Bench, Taxi, IR
     slot_order = {"STARTER": 1, "BENCH": 2, "TAXI": 3, "IR": 4}
-    roster_list.sort(key=lambda x: (slot_order.get(x["slot"], 5), x["pos"]))
+    rows.sort(key=lambda x: (slot_order.get(x["slot"], 5), x["pos"], x["name"]))
 
     if format.lower() == "json":
-        return JSONResponse(content=roster_list)
+        return rows
 
     output = io.StringIO()
-    fieldnames = ["id", "name", "pos", "team", "slot", "depth_chart", "exp"]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer = csv.DictWriter(output, fieldnames=["id", "name", "pos", "team", "slot", "depth_chart", "exp"])
     writer.writeheader()
-    writer.writerows(roster_list)
+    writer.writerows(rows)
+    return PlainTextResponse(output.getvalue(), media_type="text/csv")
 
-    return Response(content=output.getvalue(), media_type="text/csv")
 
-
-@app.get("/free-agents")
-def get_free_agents(
-    league_id: str = Query(..., description="Sleeper League ID"),
-    positions: Optional[str] = Query(
-        None, description="Comma-separated list (e.g. RB,WR,TE)"
-    ),
-    active_teams_only: bool = Query(
-        True,
-        description="Require player to belong to one of the 32 active NFL teams",
-    ),
-    trending_only: bool = Query(
-        False, description="Only return players actively trending as adds"
-    ),
-    sort_by: str = Query(
-        "trending_count",
-        description="Sort field: trending_count, depth_chart, name, or exp",
-    ),
-    limit: int = Query(
-        75, le=200, description="Max players to return (max 200)"
-    ),
-    format: str = Query("csv", description="Response format: 'csv' or 'json'"),
+@app.get("/matchup")
+async def get_matchup(
+    league_id: str = "1399229018905034752",
+    username: str = "jgatz12",
+    week: Optional[int] = None,
+    starters_only: bool = False,
+    format: str = "csv"
 ):
-    roster_res = requests.get(
-        f"https://api.sleeper.app/v1/league/{league_id}/rosters"
-    )
-    if roster_res.status_code != 200:
-        return Response(
-            content="Invalid League ID",
-            status_code=400,
-            media_type="text/plain",
-        )
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        players = await get_cached_players(client)
 
-    rostered_ids = set()
-    for team in roster_res.json():
-        if team.get("players"):
-            for pid in team["players"]:
-                rostered_ids.add(str(pid))
+        # 1. Resolve active week if omitted
+        if week is None:
+            state_resp = await client.get("https://api.sleeper.app/v1/state/nfl")
+            if state_resp.status_code != 200:
+                raise HTTPException(status_code=502, detail="Failed to fetch NFL state.")
+            week = state_resp.json().get("week", 1)
 
-    all_players = get_cached_players()
-    trending_map = get_cached_trending()
+        users_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
+        rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
+        matchups_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}")
 
-    if positions:
-        target_positions = {
-            pos.strip().upper() for pos in positions.split(",") if pos.strip()
-        }
-    else:
-        target_positions = VALID_OFFENSIVE_POSITIONS
+        if any(r.status_code != 200 for r in (users_resp, rosters_resp, matchups_resp)):
+            raise HTTPException(status_code=502, detail="Failed to fetch matchup data.")
 
-    candidates = []
-    for pid, info in all_players.items():
-        str_pid = str(pid)
+        users = users_resp.json()
+        rosters = rosters_resp.json()
+        matchups = matchups_resp.json()
 
-        if str_pid in rostered_ids:
-            continue
+    # Map user_id to display name & roster_id to user display name
+    user_id_to_name = {u["user_id"]: u.get("display_name", "Unknown") for u in users}
+    roster_id_to_name = {r["roster_id"]: user_id_to_name.get(r.get("owner_id"), f"Team {r['roster_id']}") for r in rosters}
 
-        raw_positions = set(info.get("fantasy_positions") or [])
-        pos_str = info.get("position") or ""
-        team = (info.get("team") or "").upper().strip()
-        status = info.get("status")
+    # Find target user's roster_id
+    target_user = next((u for u in users if u.get("display_name", "").lower() == username.lower()), None)
+    if not target_user:
+        raise HTTPException(status_code=404, detail=f"User {username} not found.")
 
-        if raw_positions.intersection(DISALLOWED_POSITIONS) or (
-            pos_str in DISALLOWED_POSITIONS
-        ):
-            continue
+    target_roster = next((r for r in rosters if r.get("owner_id") == target_user["user_id"]), None)
+    if not target_roster:
+        raise HTTPException(status_code=404, detail=f"Roster not found for user {username}.")
 
-        matched_positions = raw_positions.intersection(target_positions)
-        if not matched_positions:
-            continue
+    target_roster_id = target_roster["roster_id"]
 
-        if active_teams_only and team not in ACTIVE_NFL_TEAMS:
-            continue
+    # Locate user matchup
+    user_matchup = next((m for m in matchups if m.get("roster_id") == target_roster_id), None)
+    if not user_matchup:
+        raise HTTPException(status_code=404, detail=f"Matchup data not found for week {week}.")
 
-        if status in ["Inactive", "Retired", None]:
-            continue
+    matchup_id = user_matchup.get("matchup_id")
+    opponent_matchup = next((m for m in matchups if m.get("matchup_id") == matchup_id and m.get("roster_id") != target_roster_id), None)
 
-        trend_count = trending_map.get(str_pid, 0)
-        if trending_only and trend_count == 0:
-            continue
+    teams_to_process = [("USER", user_matchup, roster_id_to_name.get(target_roster_id, username))]
+    if opponent_matchup:
+        opp_name = roster_id_to_name.get(opponent_matchup["roster_id"], "Opponent")
+        teams_to_process.append(("OPPONENT", opponent_matchup, opp_name))
 
-        candidates.append(
-            {
-                "id": str_pid,
-                "name": info.get("full_name")
-                or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip(),
-                "pos": "/".join(matched_positions),
-                "team": team,
-                "status": status,
-                "depth_chart": info.get("depth_chart_order") or 99,
-                "exp": info.get("years_exp") or 0,
-                "trending_count": trend_count,
-            }
-        )
+    rows = []
+    for side, m_data, team_name in teams_to_process:
+        starter_ids = set(m_data.get("starters") or [])
+        player_ids = starter_ids if starters_only else (m_data.get("players") or [])
 
-    if sort_by == "trending_count":
-        candidates.sort(
-            key=lambda x: (x["trending_count"], -x["depth_chart"]), reverse=True
-        )
-    elif sort_by == "depth_chart":
-        candidates.sort(key=lambda x: (x["depth_chart"], -x["trending_count"]))
-    elif sort_by == "exp":
-        candidates.sort(key=lambda x: x["exp"], reverse=True)
-    elif sort_by == "name":
-        candidates.sort(key=lambda x: x["name"].lower())
-
-    results = candidates[:limit]
+        for pid in player_ids:
+            p_info = players.get(pid, {})
+            slot = "STARTER" if pid in starter_ids else "BENCH"
+            rows.append({
+                "week": week,
+                "side": side,
+                "team_name": team_name,
+                "slot": slot,
+                "id": pid,
+                "name": p_info.get("full_name") or f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip(),
+                "pos": p_info.get("position", "NA"),
+                "nfl_team": p_info.get("team", "FA"),
+                "depth_chart": p_info.get("depth_chart_order") or "",
+                "proj_or_actual_pts": m_data.get("custom_points") or 0.0
+            })
 
     if format.lower() == "json":
-        return JSONResponse(content=results)
+        return rows
 
     output = io.StringIO()
-    fieldnames = [
-        "id",
-        "name",
-        "pos",
-        "team",
-        "status",
-        "depth_chart",
-        "exp",
-        "trending_count",
-    ]
-    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["week", "side", "team_name", "slot", "id", "name", "pos", "nfl_team", "depth_chart", "proj_or_actual_pts"]
+    )
     writer.writeheader()
-    writer.writerows(results)
-
-    return Response(content=output.getvalue(), media_type="text/csv")
+    writer.writerows(rows)
+    return PlainTextResponse(output.getvalue(), media_type="text/csv")
