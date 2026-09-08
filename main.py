@@ -7,9 +7,9 @@ from fastapi.responses import JSONResponse
 import requests
 
 app = FastAPI(
-    title="Sleeper Free Agent API",
-    version="1.3.0",
-    description="Filtered free-agent lookup for Sleeper fantasy leagues.",
+    title="Sleeper Free Agent & Roster API",
+    version="1.4.0",
+    description="Filtered free-agent lookup and team roster inspection for Sleeper fantasy leagues.",
 )
 
 PLAYERS_CACHE = {}
@@ -20,7 +20,6 @@ TRENDING_CACHE = {}
 TRENDING_TIMESTAMP = 0
 TRENDING_CACHE_DURATION = 900  # 15 minutes
 
-# The 32 active NFL franchise codes (strictly blocks FA, None, and defunct teams)
 ACTIVE_NFL_TEAMS = {
     "ARI",
     "ATL",
@@ -56,10 +55,8 @@ ACTIVE_NFL_TEAMS = {
     "WAS",
 }
 
-# Strictly standard offensive fantasy positions
 VALID_OFFENSIVE_POSITIONS = {"QB", "RB", "WR", "TE", "K", "DEF"}
 
-# Positions that disqualify a player from standard fantasy pools
 DISALLOWED_POSITIONS = {
     "OL",
     "OT",
@@ -110,9 +107,116 @@ def get_cached_trending():
 def health_check():
     return {
         "status": "ok",
-        "version": "1.3.0",
-        "message": "Sleeper Free Agent API is live",
+        "version": "1.4.0",
+        "message": "Sleeper Free Agent & Roster API is live",
     }
+
+
+@app.get("/roster")
+def get_roster(
+    league_id: str = Query(
+        "1399229018905034752", description="Sleeper League ID"
+    ),
+    username: str = Query(
+        "jgatz12",
+        description="Sleeper username or display name to fetch roster for",
+    ),
+    format: str = Query("csv", description="Output format: 'csv' or 'json'"),
+):
+    # 1. Map users to identify owner_id
+    users_res = requests.get(
+        f"https://api.sleeper.app/v1/league/{league_id}/users"
+    )
+    if users_res.status_code != 200:
+        return Response(
+            content="Invalid League ID",
+            status_code=400,
+            media_type="text/plain",
+        )
+
+    target_user_id = None
+    clean_username = username.strip().lower()
+    for u in users_res.json():
+        uname = (u.get("username") or "").lower()
+        dname = (u.get("display_name") or "").lower()
+        tname = (u.get("metadata", {}).get("team_name") or "").lower()
+        if clean_username in [uname, dname, tname]:
+            target_user_id = u.get("user_id")
+            break
+
+    # 2. Fetch rosters
+    roster_res = requests.get(
+        f"https://api.sleeper.app/v1/league/{league_id}/rosters"
+    )
+    if roster_res.status_code != 200:
+        return Response(
+            content="Could not fetch rosters",
+            status_code=400,
+            media_type="text/plain",
+        )
+
+    target_roster = None
+    for r in roster_res.json():
+        if r.get("owner_id") == target_user_id:
+            target_roster = r
+            break
+
+    if not target_roster:
+        return Response(
+            content=f"Roster not found for user: {username}",
+            status_code=404,
+            media_type="text/plain",
+        )
+
+    all_players = get_cached_players()
+    starters = set(target_roster.get("starters") or [])
+    taxi = set(target_roster.get("taxi") or [])
+    reserve = set(target_roster.get("reserve") or [])
+    all_rostered = target_roster.get("players") or []
+
+    roster_list = []
+    for pid in all_rostered:
+        str_pid = str(pid)
+        info = all_players.get(str_pid, {})
+
+        # Slot classification
+        if str_pid in starters:
+            slot = "STARTER"
+        elif str_pid in taxi:
+            slot = "TAXI"
+        elif str_pid in reserve:
+            slot = "IR"
+        else:
+            slot = "BENCH"
+
+        roster_list.append(
+            {
+                "id": str_pid,
+                "name": info.get("full_name")
+                or f"{info.get('first_name', '')} {info.get('last_name', '')}".strip()
+                or str_pid,
+                "pos": "/".join(info.get("fantasy_positions") or ["DEF"]),
+                "team": info.get("team") or "FA",
+                "slot": slot,
+                "depth_chart": info.get("depth_chart_order") or 99,
+                "exp": info.get("years_exp") or 0,
+            }
+        )
+
+    # Sort: Starters first, then Bench, Taxi, IR
+    slot_order = {"STARTER": 1, "BENCH": 2, "TAXI": 3, "IR": 4}
+    roster_list.sort(key=lambda x: (slot_order.get(x["slot"], 5), x["pos"]))
+
+    if format.lower() == "json":
+        return JSONResponse(content=roster_list)
+
+    output = io.StringIO()
+    fieldnames = ["id", "name", "pos", "team", "slot", "depth_chart", "exp"]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(roster_list)
+
+    return Response(content=output.getvalue(), media_type="text/csv")
 
 
 @app.get("/free-agents")
@@ -137,7 +241,6 @@ def get_free_agents(
     ),
     format: str = Query("csv", description="Response format: 'csv' or 'json'"),
 ):
-    # 1. Fetch rosters
     roster_res = requests.get(
         f"https://api.sleeper.app/v1/league/{league_id}/rosters"
     )
@@ -157,7 +260,6 @@ def get_free_agents(
     all_players = get_cached_players()
     trending_map = get_cached_trending()
 
-    # Determine allowed positions
     if positions:
         target_positions = {
             pos.strip().upper() for pos in positions.split(",") if pos.strip()
@@ -169,7 +271,6 @@ def get_free_agents(
     for pid, info in all_players.items():
         str_pid = str(pid)
 
-        # Exclude rostered players
         if str_pid in rostered_ids:
             continue
 
@@ -178,22 +279,18 @@ def get_free_agents(
         team = (info.get("team") or "").upper().strip()
         status = info.get("status")
 
-        # Reject IDP / Linemen
         if raw_positions.intersection(DISALLOWED_POSITIONS) or (
             pos_str in DISALLOWED_POSITIONS
         ):
             continue
 
-        # Match against target offensive skill positions
         matched_positions = raw_positions.intersection(target_positions)
         if not matched_positions:
             continue
 
-        # Require an active 32-team franchise
         if active_teams_only and team not in ACTIVE_NFL_TEAMS:
             continue
 
-        # Exclude inactive / retired
         if status in ["Inactive", "Retired", None]:
             continue
 
@@ -215,7 +312,6 @@ def get_free_agents(
             }
         )
 
-    # Sorting
     if sort_by == "trending_count":
         candidates.sort(
             key=lambda x: (x["trending_count"], -x["depth_chart"]), reverse=True
