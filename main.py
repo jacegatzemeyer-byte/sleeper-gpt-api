@@ -28,7 +28,7 @@ DISALLOWED_POSITIONS = {
     "OL", "OT", "OG", "C", "DL", "DE", "DT", "LB", "DB", "CB", "S", "DEF"
 }
 
-HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.6.0"}
+HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.7.0"}
 
 
 async def refresh_players():
@@ -52,7 +52,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Sleeper Dynasty Advisor API",
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan
 )
 
@@ -88,7 +88,7 @@ async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]
 async def root():
     return {
         "status": "healthy",
-        "version": "1.6.0",
+        "version": "1.7.0",
         "players_cached": len(PLAYER_CACHE["data"]),
         "message": "Sleeper Dynasty Advisor API is active."
     }
@@ -103,7 +103,7 @@ async def get_boris_tiers(
     """Fetches Boris Chen weekly tiers from public S3 mirrors and parses into tabular format with active week and timestamp."""
     now = time.time()
     cache_key = f"{scoring}_{positions}"
-    
+
     if cache_key in BORIS_CACHE["data"] and (now - BORIS_CACHE["timestamp"] < BORIS_TTL):
         results = BORIS_CACHE["data"][cache_key]
     else:
@@ -117,7 +117,6 @@ async def get_boris_tiers(
         results = []
 
         async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
-            # Dynamically retrieve active week
             current_week = 1
             try:
                 state_resp = await client.get("https://api.sleeper.app/v1/state/nfl")
@@ -244,7 +243,10 @@ async def get_free_agents(
         return results
 
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"])
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"]
+    )
     writer.writeheader()
     writer.writerows(results)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
@@ -362,27 +364,45 @@ async def get_matchup(
         starter_ids = set(m_data.get("starters") or [])
         pids = starter_ids if starters_only else (m_data.get("players") or [])
 
+        team_points = m_data.get("points") or 0.0
+        custom_points = m_data.get("custom_points") or ""
+        players_points = m_data.get("players_points") or {}
+        r_id = m_data.get("roster_id", "")
+        m_id = m_data.get("matchup_id", "")
+
         for pid in pids:
             p_info = players.get(pid, {})
             slot = "STARTER" if pid in starter_ids else "BENCH"
+            player_pts = players_points.get(pid, 0.0)
+
             rows.append({
                 "week": week,
                 "side": side,
                 "team_name": team_name,
+                "roster_id": r_id,
+                "matchup_id": m_id,
+                "team_points": team_points,
+                "custom_points": custom_points,
                 "slot": slot,
                 "id": pid,
                 "name": p_info.get("full_name") or f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip(),
                 "pos": p_info.get("position", "NA"),
                 "nfl_team": p_info.get("team", "FA"),
-                "depth_chart": p_info.get("depth_chart_order") or "",
-                "proj_or_actual_pts": m_data.get("custom_points") or 0.0
+                "player_points": player_pts
             })
 
     if format.lower() == "json":
         return rows
 
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["week", "side", "team_name", "slot", "id", "name", "pos", "nfl_team", "depth_chart", "proj_or_actual_pts"])
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "week", "side", "team_name", "roster_id", "matchup_id",
+            "team_points", "custom_points", "slot", "id", "name",
+            "pos", "nfl_team", "player_points"
+        ]
+    )
     writer.writeheader()
     writer.writerows(rows)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
