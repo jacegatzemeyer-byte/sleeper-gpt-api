@@ -28,7 +28,7 @@ DISALLOWED_POSITIONS = {
     "OL", "OT", "OG", "C", "DL", "DE", "DT", "LB", "DB", "CB", "S", "DEF"
 }
 
-HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.7.0"}
+HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.8.0"}
 
 
 async def refresh_players():
@@ -52,9 +52,24 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Sleeper Dynasty Advisor API",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan
 )
+
+
+def compute_alert_level(game_status: Optional[str], practice: Optional[str]) -> int:
+    status_clean = (game_status or "").strip().upper()
+    practice_clean = (practice or "").strip().upper()
+
+    if status_clean in {"OUT", "IR", "PUP", "SUS", "DOUBTFUL"}:
+        return 4
+    if status_clean == "QUESTIONABLE" or practice_clean in {"DNP", "DID NOT PARTICIPATE"}:
+        return 3
+    if practice_clean in {"LIMITED", "LP"}:
+        return 2
+    if practice_clean in {"FULL", "FP"} or status_clean == "PROBABLE":
+        return 1
+    return 0
 
 
 async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
@@ -88,10 +103,127 @@ async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]
 async def root():
     return {
         "status": "healthy",
-        "version": "1.7.0",
+        "version": "1.8.0",
         "players_cached": len(PLAYER_CACHE["data"]),
         "message": "Sleeper Dynasty Advisor API is active."
     }
+
+
+@app.get("/injuries")
+async def get_injuries(
+    league_id: str = "1399229018905034752",
+    username: str = "jgatz12",
+    week: Optional[int] = None,
+    scope: str = Query("matchup", enum=["matchup", "self"]),
+    min_alert_level: int = Query(2, ge=0, le=5),
+    format: str = "csv"
+):
+    """Audits injury designations and practice participation for matchup rosters."""
+    async with httpx.AsyncClient(timeout=20.0, headers=HEADERS) as client:
+        players = await get_cached_players(client)
+
+        if week is None:
+            state_resp = await client.get("https://api.sleeper.app/v1/state/nfl")
+            week = state_resp.json().get("week", 1) if state_resp.status_code == 200 else 1
+
+        users_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/users")
+        rosters_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/rosters")
+        matchups_resp = await client.get(f"https://api.sleeper.app/v1/league/{league_id}/matchups/{week}")
+
+        if any(r.status_code != 200 for r in (users_resp, rosters_resp, matchups_resp)):
+            raise HTTPException(status_code=502, detail=f"Failed to fetch matchup data for week {week}.")
+
+        users = users_resp.json()
+        rosters = rosters_resp.json()
+        matchups = matchups_resp.json()
+
+    user_id_to_name = {u["user_id"]: u.get("display_name", "Unknown") for u in users}
+    roster_id_to_name = {r["roster_id"]: user_id_to_name.get(r.get("owner_id"), f"Team {r['roster_id']}") for r in rosters}
+
+    target_user = next((u for u in users if u.get("display_name", "").lower() == username.lower()), None)
+    if not target_user:
+        raise HTTPException(status_code=404, detail=f"User '{username}' not found in league.")
+
+    target_roster = next((r for r in rosters if r.get("owner_id") == target_user["user_id"]), None)
+    if not target_roster:
+        raise HTTPException(status_code=404, detail=f"Roster not found for '{username}'.")
+
+    target_roster_id = target_roster["roster_id"]
+    user_matchup = next((m for m in matchups if m.get("roster_id") == target_roster_id), None)
+    if not user_matchup:
+        raise HTTPException(status_code=404, detail=f"No matchup scheduled for week {week}.")
+
+    teams = [("self", user_matchup, roster_id_to_name.get(target_roster_id, username))]
+
+    if scope == "matchup":
+        matchup_id = user_matchup.get("matchup_id")
+        opp_matchup = next((m for m in matchups if m.get("matchup_id") == matchup_id and m.get("roster_id") != target_roster_id), None)
+        if opp_matchup:
+            teams.append(("opponent", opp_matchup, roster_id_to_name.get(opp_matchup["roster_id"], "Opponent")))
+
+    rows = []
+    starter_counts = {"self_total": 0, "self_clear": 0, "opp_total": 0, "opp_clear": 0}
+
+    for side, m_data, team_name in teams:
+        starter_ids = set(m_data.get("starters") or [])
+        all_ids = m_data.get("players") or []
+
+        for pid in all_ids:
+            p_info = players.get(pid, {})
+            pos = p_info.get("position", "NA")
+            is_starter = pid in starter_ids
+            slot = "STARTER" if is_starter else "BENCH"
+
+            # Filter non-skill positions for clean reporting
+            if pos in DISALLOWED_POSITIONS:
+                continue
+
+            game_status = p_info.get("injury_status") or "ACTIVE"
+            practice = p_info.get("practice_participation") or "FULL"
+            body_part = p_info.get("injury_body_part") or "None"
+            alert = compute_alert_level(game_status, practice)
+
+            if is_starter:
+                key_prefix = "self" if side == "self" else "opp"
+                starter_counts[f"{key_prefix}_total"] += 1
+                if alert < 2:
+                    starter_counts[f"{key_prefix}_clear"] += 1
+
+            if alert >= min_alert_level:
+                rows.append({
+                    "week": week,
+                    "side": side,
+                    "team_name": team_name,
+                    "slot": slot,
+                    "name": p_info.get("full_name") or f"{p_info.get('first_name', '')} {p_info.get('last_name', '')}".strip(),
+                    "pos": pos,
+                    "nfl_team": p_info.get("team", "FA"),
+                    "alert_level": alert,
+                    "game_status": game_status,
+                    "practice": practice,
+                    "body_part": body_part
+                })
+
+    rows.sort(key=lambda x: (x["side"], 0 if x["slot"] == "STARTER" else 1, -x["alert_level"]))
+
+    if format.lower() == "json":
+        return {
+            "starter_clear_summary": f"Self: {starter_counts['self_clear']}/{starter_counts['self_total']} clear | Opp: {starter_counts['opp_clear']}/{starter_counts['opp_total']} clear",
+            "flagged_players": rows
+        }
+
+    output = io.StringIO()
+    output.write(f"# Starter Clearance: Self: {starter_counts['self_clear']}/{starter_counts['self_total']} clear | Opp: {starter_counts['opp_clear']}/{starter_counts['opp_total']} clear\n")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "week", "side", "team_name", "slot", "name", "pos", "nfl_team",
+            "alert_level", "game_status", "practice", "body_part"
+        ]
+    )
+    writer.writeheader()
+    writer.writerows(rows)
+    return PlainTextResponse(output.getvalue(), media_type="text/csv")
 
 
 @app.get("/boris-tiers")
@@ -100,19 +232,13 @@ async def get_boris_tiers(
     scoring: str = Query("ppr", enum=["standard", "half_ppr", "ppr"]),
     format: str = "csv"
 ):
-    """Fetches Boris Chen weekly tiers from public S3 mirrors and parses into tabular format with active week and timestamp."""
     now = time.time()
     cache_key = f"{scoring}_{positions}"
 
     if cache_key in BORIS_CACHE["data"] and (now - BORIS_CACHE["timestamp"] < BORIS_TTL):
         results = BORIS_CACHE["data"][cache_key]
     else:
-        suffix = ""
-        if scoring == "ppr":
-            suffix = "-PPR"
-        elif scoring == "half_ppr":
-            suffix = "-HALF"
-
+        suffix = "-PPR" if scoring == "ppr" else ("-HALF" if scoring == "half_ppr" else "")
         requested_pos = [p.strip().upper() for p in positions.split(",") if p.strip()]
         results = []
 
@@ -140,7 +266,6 @@ async def get_boris_tiers(
                         continue
 
                     last_modified = resp.headers.get("last-modified", "Unknown")
-
                     lines = resp.text.strip().split("\n")
                     rank = 1
                     for line in lines:
@@ -172,10 +297,7 @@ async def get_boris_tiers(
         return results
 
     output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["week", "updated_at", "position", "scoring", "tier", "rank", "name"]
-    )
+    writer = csv.DictWriter(output, fieldnames=["week", "updated_at", "position", "scoring", "tier", "rank", "name"])
     writer.writeheader()
     writer.writerows(results)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
@@ -243,10 +365,7 @@ async def get_free_agents(
         return results
 
     output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"]
-    )
+    writer = csv.DictWriter(output, fieldnames=["id", "name", "pos", "team", "status", "depth_chart", "exp", "trending_count"])
     writer.writeheader()
     writer.writerows(results)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
