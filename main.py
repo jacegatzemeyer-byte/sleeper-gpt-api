@@ -39,6 +39,7 @@ async def refresh_players():
             if resp.status_code == 200:
                 PLAYER_CACHE["data"] = resp.json()
                 PLAYER_CACHE["timestamp"] = time.time()
+                print(f"[Cache] Successfully loaded {len(PLAYER_CACHE['data'])} NFL players.")
     except Exception as e:
         print(f"[Cache Error] Failed to refresh players: {e}")
 
@@ -66,7 +67,7 @@ async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
                 PLAYER_CACHE["timestamp"] = now
         except Exception:
             if not PLAYER_CACHE["data"]:
-                raise HTTPException(status_code=503, detail="Player catalog initializing.")
+                raise HTTPException(status_code=503, detail="Player catalog initializing. Retry in 10s.")
     return PLAYER_CACHE["data"]
 
 
@@ -99,15 +100,13 @@ async def get_boris_tiers(
     scoring: str = Query("ppr", enum=["standard", "half_ppr", "ppr"]),
     format: str = "csv"
 ):
-    """Fetches Boris Chen weekly tiers from public S3 mirrors and parses into tabular format."""
+    """Fetches Boris Chen weekly tiers from public S3 mirrors and parses into tabular format with active week and timestamp."""
     now = time.time()
     cache_key = f"{scoring}_{positions}"
+    
     if cache_key in BORIS_CACHE["data"] and (now - BORIS_CACHE["timestamp"] < BORIS_TTL):
         results = BORIS_CACHE["data"][cache_key]
     else:
-        # S3 naming conventions
-        # QB, K, DST do not have PPR variations.
-        # RB, WR, TE, and FLX use -PPR or -HALF suffixes.
         suffix = ""
         if scoring == "ppr":
             suffix = "-PPR"
@@ -118,8 +117,16 @@ async def get_boris_tiers(
         results = []
 
         async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+            # Dynamically retrieve active week
+            current_week = 1
+            try:
+                state_resp = await client.get("https://api.sleeper.app/v1/state/nfl")
+                if state_resp.status_code == 200:
+                    current_week = state_resp.json().get("week", 1)
+            except Exception:
+                pass
+
             for pos in requested_pos:
-                file_pos = pos
                 if pos in {"QB", "K", "DST"}:
                     file_name = f"text_{pos}.txt"
                 elif pos == "FLX":
@@ -133,6 +140,8 @@ async def get_boris_tiers(
                     if resp.status_code != 200:
                         continue
 
+                    last_modified = resp.headers.get("last-modified", "Unknown")
+
                     lines = resp.text.strip().split("\n")
                     rank = 1
                     for line in lines:
@@ -145,6 +154,8 @@ async def get_boris_tiers(
 
                         for name in player_names:
                             results.append({
+                                "week": current_week,
+                                "updated_at": last_modified,
                                 "position": pos,
                                 "scoring": scoring.upper(),
                                 "tier": int(tier_num) if tier_num.isdigit() else tier_num,
@@ -162,7 +173,10 @@ async def get_boris_tiers(
         return results
 
     output = io.StringIO()
-    writer = csv.DictWriter(output, fieldnames=["position", "scoring", "tier", "rank", "name"])
+    writer = csv.DictWriter(
+        output,
+        fieldnames=["week", "updated_at", "position", "scoring", "tier", "rank", "name"]
+    )
     writer.writeheader()
     writer.writerows(results)
     return PlainTextResponse(output.getvalue(), media_type="text/csv")
