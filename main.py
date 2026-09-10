@@ -8,12 +8,14 @@ from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import PlainTextResponse
 import httpx
 
-# In-memory storage
+# In-memory caches
 PLAYER_CACHE: Dict[str, Any] = {"data": {}, "timestamp": 0}
 TRENDING_CACHE: Dict[str, Any] = {"data": [], "timestamp": 0}
+BORIS_CACHE: Dict[str, Any] = {"data": {}, "timestamp": 0}
 
 PLAYER_TTL = 86400   # 24 hours
 TRENDING_TTL = 900   # 15 minutes
+BORIS_TTL = 7200     # 2 hours
 
 ACTIVE_NFL_TEAMS = {
     "ARI", "ATL", "BAL", "BUF", "CAR", "CHI", "CIN", "CLE", "DAL", "DEN",
@@ -26,7 +28,7 @@ DISALLOWED_POSITIONS = {
     "OL", "OT", "OG", "C", "DL", "DE", "DT", "LB", "DB", "CB", "S", "DEF"
 }
 
-HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.5.1"}
+HEADERS = {"User-Agent": "DynastyAdvisorMiddleware/1.6.0"}
 
 
 async def refresh_players():
@@ -37,28 +39,25 @@ async def refresh_players():
             if resp.status_code == 200:
                 PLAYER_CACHE["data"] = resp.json()
                 PLAYER_CACHE["timestamp"] = time.time()
-                print(f"[Cache] Successfully loaded {len(PLAYER_CACHE['data'])} NFL players.")
     except Exception as e:
         print(f"[Cache Error] Failed to refresh players: {e}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Pre-warm the cache at startup so incoming GPT requests respond instantly
     asyncio.create_task(refresh_players())
     yield
 
 
 app = FastAPI(
     title="Sleeper Dynasty Advisor API",
-    version="1.5.1",
+    version="1.6.0",
     lifespan=lifespan
 )
 
 
 async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
     now = time.time()
-    # If empty or expired, refresh, but fall back to existing data on failure
     if not PLAYER_CACHE["data"] or (now - PLAYER_CACHE["timestamp"] > PLAYER_TTL):
         try:
             resp = await client.get("https://api.sleeper.app/v1/players/nfl")
@@ -67,7 +66,7 @@ async def get_cached_players(client: httpx.AsyncClient) -> Dict[str, Any]:
                 PLAYER_CACHE["timestamp"] = now
         except Exception:
             if not PLAYER_CACHE["data"]:
-                raise HTTPException(status_code=503, detail="Sleeper player catalog currently initializing. Retry in 10s.")
+                raise HTTPException(status_code=503, detail="Player catalog initializing.")
     return PLAYER_CACHE["data"]
 
 
@@ -80,7 +79,7 @@ async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]
                 TRENDING_CACHE["data"] = resp.json()
                 TRENDING_CACHE["timestamp"] = now
         except Exception:
-            pass  # Fail gracefully to existing cache or empty list
+            pass
     return TRENDING_CACHE["data"]
 
 
@@ -88,10 +87,85 @@ async def get_cached_trending(client: httpx.AsyncClient) -> List[Dict[str, Any]]
 async def root():
     return {
         "status": "healthy",
-        "version": "1.5.1",
+        "version": "1.6.0",
         "players_cached": len(PLAYER_CACHE["data"]),
         "message": "Sleeper Dynasty Advisor API is active."
     }
+
+
+@app.get("/boris-tiers")
+async def get_boris_tiers(
+    positions: Optional[str] = Query("QB,RB,WR,TE,FLX,K,DST", description="Comma-separated: QB,RB,WR,TE,FLX,K,DST"),
+    scoring: str = Query("ppr", enum=["standard", "half_ppr", "ppr"]),
+    format: str = "csv"
+):
+    """Fetches Boris Chen weekly tiers from public S3 mirrors and parses into tabular format."""
+    now = time.time()
+    cache_key = f"{scoring}_{positions}"
+    if cache_key in BORIS_CACHE["data"] and (now - BORIS_CACHE["timestamp"] < BORIS_TTL):
+        results = BORIS_CACHE["data"][cache_key]
+    else:
+        # S3 naming conventions
+        # QB, K, DST do not have PPR variations.
+        # RB, WR, TE, and FLX use -PPR or -HALF suffixes.
+        suffix = ""
+        if scoring == "ppr":
+            suffix = "-PPR"
+        elif scoring == "half_ppr":
+            suffix = "-HALF"
+
+        requested_pos = [p.strip().upper() for p in positions.split(",") if p.strip()]
+        results = []
+
+        async with httpx.AsyncClient(timeout=15.0, headers=HEADERS) as client:
+            for pos in requested_pos:
+                file_pos = pos
+                if pos in {"QB", "K", "DST"}:
+                    file_name = f"text_{pos}.txt"
+                elif pos == "FLX":
+                    file_name = f"text_FLX{suffix}.txt"
+                else:
+                    file_name = f"text_{pos}{suffix}.txt"
+
+                url = f"https://s3-us-west-1.amazonaws.com/fftiers/out/{file_name}"
+                try:
+                    resp = await client.get(url)
+                    if resp.status_code != 200:
+                        continue
+
+                    lines = resp.text.strip().split("\n")
+                    rank = 1
+                    for line in lines:
+                        line = line.strip()
+                        if not line or ":" not in line:
+                            continue
+                        tier_part, players_part = line.split(":", 1)
+                        tier_num = tier_part.replace("Tier", "").strip()
+                        player_names = [p.strip() for p in players_part.split(",") if p.strip()]
+
+                        for name in player_names:
+                            results.append({
+                                "position": pos,
+                                "scoring": scoring.upper(),
+                                "tier": int(tier_num) if tier_num.isdigit() else tier_num,
+                                "rank": rank,
+                                "name": name
+                            })
+                            rank += 1
+                except Exception:
+                    continue
+
+        BORIS_CACHE["data"][cache_key] = results
+        BORIS_CACHE["timestamp"] = now
+
+    if format.lower() == "json":
+        return results
+
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=["position", "scoring", "tier", "rank", "name"])
+    writer.writeheader()
+    writer.writerows(results)
+    return PlainTextResponse(output.getvalue(), media_type="text/csv")
 
 
 @app.get("/free-agents")
